@@ -1,0 +1,102 @@
+name: Build MyLinux i386 ISO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev cpio rsync xz-utils bzip2 gzip grub-pc-bin grub-common xorriso qemu-system-x86 file
+
+      - name: Build ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+          JOBS="$(nproc)"
+          mkdir -p src build/rootfs build/iso output
+          curl -fL --retry 5 --retry-all-errors -o src/linux-7.2.tar.xz https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.xz
+          tar -xJf src/linux-7.2.tar.xz -C src
+          curl -fL --retry 5 --retry-all-errors -o src/busybox-1.36.1.tar.bz2 https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          tar -xjf src/busybox-1.36.1.tar.bz2 -C src
+          K="$GITHUB_WORKSPACE/src/linux-7.2"
+          B="$GITHUB_WORKSPACE/src/busybox-1.36.1"
+          R="$GITHUB_WORKSPACE/build/rootfs"
+          I="$GITHUB_WORKSPACE/build/iso"
+
+          make -C "$B" distclean
+          make -C "$B" defconfig
+          sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "$B/.config"
+          make -C "$B" olddefconfig
+          make -C "$B" -j"$JOBS"
+          make -C "$B" CONFIG_PREFIX="$R" install
+
+          mkdir -p "$R"/{dev,proc,sys,run,tmp,etc,root,mnt,home,var,usr/bin,usr/sbin}
+          chmod 1777 "$R/tmp"
+          printf '%s\n' 'root:x:0:0:root:/root:/bin/sh' > "$R/etc/passwd"
+          printf '%s\n' 'root:x:0:' > "$R/etc/group"
+          echo mylinux > "$R/etc/hostname"
+
+          cat > "$R/etc/inittab" <<'EOF'
+::sysinit:/etc/init.d/rcS
+tty1::askfirst:-/bin/sh
+tty2::askfirst:-/bin/sh
+::restart:/sbin/init
+EOF
+          mkdir -p "$R/etc/init.d"
+          cat > "$R/etc/init.d/rcS" <<'EOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+hostname mylinux
+echo
+echo "======================================"
+echo "          MyLinux i386 Live"
+echo "======================================"
+echo " Linux: $(uname -r)"
+echo " Shell: BusyBox ash"
+echo
+EOF
+          chmod +x "$R/etc/init.d/rcS"
+
+          make -C "$K" mrproper
+          make -C "$K" i386_defconfig
+          make -C "$K" olddefconfig
+          make -C "$K" -j"$JOBS" bzImage
+          test -f "$K/arch/x86/boot/bzImage"
+
+          mkdir -p "$I/boot/grub"
+          cp "$K/arch/x86/boot/bzImage" "$I/boot/vmlinuz"
+          (cd "$R" && find . -print0 | cpio --null -o -H newc) | gzip -9 > "$I/boot/initramfs.gz"
+
+          cat > "$I/boot/grub/grub.cfg" <<'EOF'
+set timeout=3
+set default=0
+menuentry "MyLinux i386 Live" {
+    linux /boot/vmlinuz
+    initrd /boot/initramfs.gz
+}
+EOF
+
+          grub-mkrescue -o output/mylinux-i386.iso "$I"
+          SIZE="$(stat -c '%s' output/mylinux-i386.iso)"
+          echo "ISO size: $SIZE bytes ($(numfmt --to=iec "$SIZE"))"
+          test "$SIZE" -lt 500000000
+          file output/mylinux-i386.iso
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: mylinux-i386-iso
+          path: output/mylinux-i386.iso
+          if-no-files-found: error
+          retention-days: 30
